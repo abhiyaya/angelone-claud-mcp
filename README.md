@@ -17,6 +17,7 @@ This project demonstrates the integration with Angel One's SmartAPI for trading 
 - Angel One trading account
 - API credentials from Angel One
 - Claude Desktop (for enhanced development experience)
+- MCP CLI (for running the FastMCP server)
 
 ## Environment Variables
 
@@ -35,7 +36,7 @@ correlation_id=your_correlation_id
 1. Clone the repository:
 ```bash
 git clone <repository-url>
-cd angelone-smartapi
+cd angelone-claud-mcp
 ```
 
 2. Create and activate a Python virtual environment:
@@ -51,12 +52,17 @@ source .venvs/mcp310/bin/activate  # On Unix/macOS
 pip install -r requirements.txt
 ```
 
-4. Install Claude Desktop:
+4. Install MCP CLI:
+```bash
+pip install mcp[cli]
+```
+
+5. Install Claude Desktop:
    - Download Claude Desktop from the official website
    - Follow the installation instructions for your operating system
    - Launch Claude Desktop
 
-5. Configure Claude Desktop:
+6. Configure Claude Desktop:
    - Open Claude Desktop
    - Go to Settings
    - Add the following configuration to your `claude_desktop_config.json`:
