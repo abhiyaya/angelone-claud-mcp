@@ -54,7 +54,7 @@ pip install -r requirements.txt
 
 4. Install MCP CLI:
 ```bash
-pip install mcp[cli]
+pip install "mcp[cli]"
 ```
 
 5. Install Claude Desktop:
