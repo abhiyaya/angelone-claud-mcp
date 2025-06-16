@@ -69,7 +69,7 @@ pip install "mcp[cli]"
    ```json
    {
      "mcpServers": {
-       "Demo": {
+       "AngelOne": {
          "command": "/path/to/your/venv/bin/mcp",
          "args": [
            "run",
