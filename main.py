@@ -2,45 +2,167 @@
 from SmartApi import SmartConnect
 import os
 import pyotp
+import time
+import threading
+from datetime import datetime, timedelta
 from logzero import logger
 from dotenv import load_dotenv
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from mcp.server.fastmcp import FastMCP
+from functools import wraps
 
 # Create an MCP server
 mcp = FastMCP("AngelOne")
 load_dotenv()
-api_key = os.environ.get('api_key')
-username = os.environ.get('username')
-pwd = os.environ.get('pwd')
-token = os.environ.get('token')
-correlation_id = os.environ.get('correlation_id')
 
-def get_smart_api_session():
+class AuthManager:
     """
-    Establishes and returns an authenticated session with Angel One SmartAPI.
-    This function handles the authentication process and creates a new SmartAPI session. 
+    Manages authentication and session lifecycle for Angel One SmartAPI
+    """
     
-    Returns:
-        SmartConnect: An authenticated SmartAPI session instance
+    def __init__(self):
+        self.api_key = os.environ.get('ANGEL_API_KEY')
+        self.username = os.environ.get('ANGEL_USERNAME') 
+        self.password = os.environ.get('ANGEL_PASSWORD')
+        self.totp_secret = os.environ.get('ANGEL_TOTP_SECRET')
+        self.correlation_id = os.environ.get('ANGEL_CORRELATION_ID')
         
-    Raises:
-        Exception: If authentication fails or if there's an error in the process
-    """
-    smartApi = SmartConnect(api_key)
-    try:
-        totp = pyotp.TOTP(token).now()
-        data = smartApi.generateSession(username, pwd, totp)
-        if data['status'] == False:
-            logger.error(data)
-            raise Exception("Failed to authenticate with SmartAPI")
-        return smartApi
-    except Exception as e:
-        logger.error(f"Authentication failed: {e}")
-        raise e
+        # Validate required credentials
+        self._validate_credentials()
+        
+        # Session management
+        self._smart_api: Optional[SmartConnect] = None
+        self._session_token: Optional[str] = None
+        self._session_expiry: Optional[datetime] = None
+        self._auth_lock = threading.Lock()
+        
+        # Session refresh settings
+        self.SESSION_REFRESH_BUFFER = 300  # Refresh 5 minutes before expiry
+        self.MAX_RETRY_ATTEMPTS = 3
+        self.RETRY_DELAY = 1  # seconds
     
+    def _validate_credentials(self):
+        """Validate that all required credentials are present"""
+        required_vars = {
+            'ANGEL_API_KEY': self.api_key,
+            'ANGEL_USERNAME': self.username,
+            'ANGEL_PASSWORD': self.password,
+            'ANGEL_TOTP_SECRET': self.totp_secret
+        }
+        
+        missing_vars = [var for var, value in required_vars.items() if not value]
+        if missing_vars:
+            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+    
+    def _generate_totp(self) -> str:
+        """Generate TOTP token"""
+        try:
+            return pyotp.TOTP(self.totp_secret).now()
+        except Exception as e:
+            logger.error(f"Failed to generate TOTP: {e}")
+            raise
+    
+    def _create_new_session(self) -> SmartConnect:
+        """Create a new authenticated session"""
+        smart_api = SmartConnect(self.api_key)
+        
+        for attempt in range(self.MAX_RETRY_ATTEMPTS):
+            try:
+                totp = self._generate_totp()
+                response = smart_api.generateSession(self.username, self.password, totp)
+                
+                if not response.get('status', False):
+                    error_msg = response.get('message', 'Unknown authentication error')
+                    logger.error(f"Authentication failed: {error_msg}")
+                    
+                    if attempt < self.MAX_RETRY_ATTEMPTS - 1:
+                        logger.info(f"Retrying authentication (attempt {attempt + 2}/{self.MAX_RETRY_ATTEMPTS})")
+                        time.sleep(self.RETRY_DELAY)
+                        continue
+                    else:
+                        raise Exception(f"Authentication failed after {self.MAX_RETRY_ATTEMPTS} attempts: {error_msg}")
+                
+                # Extract session info
+                data = response.get('data', {})
+                self._session_token = data.get('jwtToken')
+                
+                # Calculate session expiry
+                self._session_expiry = datetime.now() + timedelta(hours=24)
+                
+                logger.info("Successfully authenticated with Angel One SmartAPI")
+                return smart_api
+                
+            except Exception as e:
+                if attempt < self.MAX_RETRY_ATTEMPTS - 1:
+                    logger.warning(f"Authentication attempt {attempt + 1} failed: {e}")
+                    time.sleep(self.RETRY_DELAY)
+                else:
+                    logger.error(f"All authentication attempts failed: {e}")
+                    raise
+        
+        raise Exception("Authentication failed after all retry attempts")
+    
+    def _is_session_valid(self) -> bool:
+        """Check if current session is valid and not expired"""
+        if not self._smart_api or not self._session_token or not self._session_expiry:
+            return False
+        
+        # Check if session is close to expiry
+        time_until_expiry = self._session_expiry - datetime.now()
+        return time_until_expiry.total_seconds() > self.SESSION_REFRESH_BUFFER
+    
+    def get_authenticated_session(self) -> SmartConnect:
+        """
+        Get an authenticated SmartConnect session, creating or refreshing as needed
+        Thread-safe implementation
+        """
+        with self._auth_lock:
+            if self._is_session_valid():
+                return self._smart_api
+            
+            logger.info("Creating new session or refreshing expired session")
+            self._smart_api = self._create_new_session()
+            return self._smart_api
+    
+    def invalidate_session(self):
+        """Invalidate current session (useful for error recovery)"""
+        with self._auth_lock:
+            self._smart_api = None
+            self._session_token = None
+            self._session_expiry = None
+            logger.info("Session invalidated")
+
+# Global auth manager instance
+auth_manager = AuthManager()
+
+def handle_api_errors(func):
+    """Decorator to handle common API errors and retry with fresh session if needed"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            # Check for authentication-related errors
+            if any(keyword in error_msg for keyword in ['token', 'unauthorized', 'expired', 'invalid session']):
+                logger.warning(f"Authentication error detected: {e}")
+                logger.info("Attempting to refresh session and retry")
+                
+                # Invalidate current session and retry once
+                auth_manager.invalidate_session()
+                try:
+                    return func(*args, **kwargs)
+                except Exception as retry_error:
+                    logger.error(f"Retry after session refresh also failed: {retry_error}")
+                    raise retry_error
+            else:
+                # Re-raise non-authentication errors
+                raise e
+    return wrapper
 
 @mcp.tool()
+@handle_api_errors
 def get_proftfolio() -> Dict[str, Any]:
     """
     Retrieves the complete portfolio holdings for the authenticated user.
@@ -57,14 +179,19 @@ def get_proftfolio() -> Dict[str, Any]:
         Exception: If the API call fails or if there's an error in processing the response
     """
     try:
-        smartApi = get_smart_api_session()
-        allholding = smartApi.holding()
+        smart_api = auth_manager.get_authenticated_session()
+        allholding = smart_api.holding()
+        
+        if not allholding.get('status', False):
+            raise Exception(f"API returned error: {allholding.get('message', 'Unknown error')}")
+            
         return allholding
     except Exception as e:
         logger.exception(f"Failed to get portfolio: {e}")
         raise e
 
 @mcp.tool()
+@handle_api_errors
 def get_candle_data(start_time: str, end_time: str, symboltoken: str = "3045", interval: str = "ONE_MINUTE"):
     """
     Retrieves historical candlestick data for a specified security.
@@ -90,21 +217,26 @@ def get_candle_data(start_time: str, end_time: str, symboltoken: str = "3045", i
     Returns None if the API call fails.
     """
     try:
-        smartApi = get_smart_api_session()
-        queryParams={
-        "exchange": "NSE",
-        "symboltoken": symboltoken,
-        "interval": interval,
-        "fromdate": start_time, 
-        "todate": end_time
+        smart_api = auth_manager.get_authenticated_session()
+        query_params = {
+            "exchange": "NSE",
+            "symboltoken": symboltoken,
+            "interval": interval,
+            "fromdate": start_time, 
+            "todate": end_time
         }
-        response = smartApi.getCandleData(queryParams)
+        response = smart_api.getCandleData(query_params)
+        
+        if not response.get('status', False):
+            raise Exception(f"API returned error: {response.get('message', 'Unknown error')}")
+            
         return response
     except Exception as e:
-        logger.exception(f"Historic Api failed: {e}")
-        return None
+        logger.exception(f"Historic API failed: {e}")
+        raise e
 
 @mcp.tool()
+@handle_api_errors
 def place_order(symbol: str, symboltoken: str, transactiontype: str, quantity: int, 
                 ordertype: str = 'LIMIT', producttype: str = 'DELIVERY', price: float = 0):
     """
@@ -129,10 +261,15 @@ def place_order(symbol: str, symboltoken: str, transactiontype: str, quantity: i
                 'data': Dict  # Order details including order ID
             }
             
-    Returns None if the order placement fails.
+    Raises:
+        Exception: If the order placement fails.
     """
     try:
-        orderParams = {
+        # Validate required parameters
+        if ordertype == 'LIMIT' and price <= 0:
+            raise ValueError("Price must be specified for LIMIT orders")
+        
+        order_params = {
             "variety": "NORMAL",
             "tradingsymbol": symbol,
             "symboltoken": symboltoken,
@@ -146,14 +283,20 @@ def place_order(symbol: str, symboltoken: str, transactiontype: str, quantity: i
             "stoploss": "0",
             "quantity": quantity
         }
-        smartApi = get_smart_api_session()
-        response = smartApi.placeOrderFullResponse(orderParams)
+        
+        smart_api = auth_manager.get_authenticated_session()
+        response = smart_api.placeOrderFullResponse(order_params)
+        
+        if not response.get('status', False):
+            raise Exception(f"Order placement failed: {response.get('message', 'Unknown error')}")
+            
         return response
     except Exception as e:
         logger.exception(f"Order placement failed: {e}")
-        return None
+        raise e
 
 @mcp.tool()
+@handle_api_errors
 def cancel_order(order_id: str, variety: str = "NORMAL"):
     """
     Cancels an existing order in the system.
@@ -172,17 +315,23 @@ def cancel_order(order_id: str, variety: str = "NORMAL"):
                 'data': Dict  # Cancellation details
             }
             
-    Returns None if the cancellation fails.
+    Raises:
+        Exception: If the cancellation fails.
     """
     try:
-        smartApi = get_smart_api_session()
-        response = smartApi.cancelOrder(order_id,variety)
+        smart_api = auth_manager.get_authenticated_session()
+        response = smart_api.cancelOrder(order_id, variety)
+        
+        if not response.get('status', False):
+            raise Exception(f"Order cancellation failed: {response.get('message', 'Unknown error')}")
+            
         return response
     except Exception as e:
         logger.exception(f"Failed to cancel the order: {e}")
-        return None
+        raise e
 
 @mcp.tool()
+@handle_api_errors
 def get_order_book():
     """
     Retrieves the complete order book for the authenticated user.
@@ -198,25 +347,52 @@ def get_order_book():
                 'data': List[Dict]  # List of orders with their details
             }
             
-    Returns None if the API call fails.
+    Raises:
+        Exception: If fetching the order book fails.
     """
     try:
-        smartApi = get_smart_api_session()
-        orderbook = smartApi.orderBook()
+        smart_api = auth_manager.get_authenticated_session()
+        orderbook = smart_api.orderBook()
+        
+        if not orderbook.get('status', False):
+            raise Exception(f"Failed to fetch order book: {orderbook.get('message', 'Unknown error')}")
+            
         return orderbook
     except Exception as e:
         logger.exception(f"Fetching order book failed: {e}")
-        return None
+        raise e
 
-@mcp.resource("greeting://{name}")
-def get_greeting(name: str) -> str:
+
+# Health check endpoint
+@mcp.tool()
+def health_check() -> Dict[str, Any]:
     """
-    Generates a personalized greeting message.
+    Performs a health check of the authentication system
     
-    Args:
-        name (str): Name of the person to greet
-        
     Returns:
-        str: A personalized greeting message
+        dict: Health status information
     """
-    return f"Namastae, {name}!"
+    try:
+        is_valid = auth_manager._is_session_valid()
+        return {
+            "status": True,
+            "message": "Service is healthy",
+            "data": {
+                "session_valid": is_valid,
+                "session_expiry": auth_manager._session_expiry.isoformat() if auth_manager._session_expiry else None
+            }
+        }
+    except Exception as e:
+        return {
+            "status": False,
+            "message": f"Health check failed: {str(e)}",
+            "data": {}
+        }
+
+if __name__ == "__main__":
+    try:
+        auth_manager.get_authenticated_session()
+        logger.info("Server started successfully with valid authentication")
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
+        raise e
